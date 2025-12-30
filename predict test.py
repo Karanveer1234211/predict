@@ -44,6 +44,14 @@ DEFAULT_TOPK = 3  # SHAP top-k (local per symbol)
 # Picks thresholds (can be tuned)
 PICKS_CONF_MIN = 0.60
 PICKS_PRED1D_MIN = 0.015  # +1.5%
+# Liquidity filter (stay in sync with predictor defaults)
+MIN_CLOSE = 50.0
+MIN_AVG20_VOL = 200_000
+
+# Probability std controls for 5D odds (mirrors predictor.py)
+PROB_STD_METHOD = "residual"
+PROB_STD_WINDOW = 252
+PROB_STD_MIN_ROWS = 60
 
 # -------------------- NSE holiday calendar (2025) --------------------
 # Update this list annually from NSE holiday page/circulars.
@@ -160,6 +168,64 @@ def inc_over(a, b):
     b = np.nan_to_num(b, nan=np.nan)
     with np.errstate(invalid='ignore', divide='ignore'):
         return (1.0 + a) / (1.0 + b) - 1.0
+
+# -------------------- Probability helpers (match predictor) --------------------
+def _phi_approx(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=float)
+    out = np.empty_like(z, dtype=float)
+    pos_inf = np.isposinf(z); neg_inf = np.isneginf(z)
+    out[pos_inf] = 1.0
+    out[neg_inf] = 0.0
+    finite = np.isfinite(z)
+    if np.any(finite):
+        x = z[finite]
+        t = 1.0 / (1.0 + 0.2316419 * np.abs(x))
+        a1, a2, a3, a4, a5 = 0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429
+        poly = ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+        nd = (1.0 / np.sqrt(2.0*np.pi)) * np.exp(-0.5 * x*x)
+        approx = 1.0 - nd * poly
+        out[finite] = np.where(x >= 0, approx, 1.0 - approx)
+    return out
+
+def prob_up_from_gaussian(mean, std):
+    mean = np.asarray(mean, dtype=float)
+    std = np.asarray(std, dtype=float)
+    safe_std = np.where(np.isfinite(std) & (std > 0), std, np.nan)
+    z = np.divide(mean, safe_std, where=np.isfinite(safe_std))
+    prob = _phi_approx(z)
+    prob = np.where(np.isfinite(prob), prob, np.where(mean >= 0, 1.0, 0.0))
+    return prob
+
+def _cross_sectional_std(values: np.ndarray, floor: float = 1e-6) -> float:
+    s = float(np.nanstd(values))
+    return s if np.isfinite(s) and s > floor else 1.0
+
+def _symbol_hist_roll_std(panel: pd.DataFrame, window: int, min_rows: int) -> pd.Series:
+    df = panel.sort_values(["symbol","timestamp"])
+    grp = df.groupby("symbol", sort=False)
+    roll = grp["ret_5d_close_pct"].apply(lambda x: pd.to_numeric(x, errors="coerce").rolling(window, min_periods=min_rows).std())
+    df2 = df.copy()
+    df2["roll_std_5d"] = roll.values
+    last = df2.groupby("symbol", as_index=True)["roll_std_5d"].tail(1)
+    return last
+
+def _residual_std_5d(panel: pd.DataFrame, oos5_df: pd.DataFrame) -> Dict[str, float]:
+    if oos5_df is None or oos5_df.empty:
+        return {}
+    idx = oos5_df.get("panel_idx")
+    pred = oos5_df.get("oos_pred")
+    if idx is None or pred is None:
+        return {}
+    idx = pd.to_numeric(idx, errors="coerce").astype(int).values
+    pred = pd.to_numeric(pred, errors="coerce").values
+    in_panel = np.isin(idx, panel.index.values)
+    idx = idx[in_panel]; pred = pred[in_panel]
+    reals = pd.to_numeric(panel.loc[idx, "ret_5d_close_pct"], errors="coerce").values
+    syms = panel.loc[idx, "symbol"].values
+    resid = reals - pred
+    df = pd.DataFrame({"symbol": syms, "resid": resid})
+    stds = df.groupby("symbol")["resid"].std().to_dict()
+    return {k: float(v) for k, v in stds.items() if np.isfinite(v) and v > 1e-6}
 
 # -------------------- SHAP (global + per-symbol local, optional) --------------------
 def compute_shap_or_importance(model, X_df, feature_names):
@@ -421,14 +487,23 @@ def build_new_watchlist(panel: pd.DataFrame, feats: list, models: dict,
                         model_conv3=None, model_conv5=None,
                         calibrator_pickle: Optional[str] = None,
                         use_local_shap: bool = True,
-                        shap_topk: int = DEFAULT_TOPK):
+                        shap_topk: int = DEFAULT_TOPK,
+                        prob_std_method: str = PROB_STD_METHOD,
+                        prob_std_window: int = PROB_STD_WINDOW,
+                        prob_std_min_rows: int = PROB_STD_MIN_ROWS,
+                        oos5_path: Optional[str] = None):
     """Build detailed watchlist + compact next-day export + picks."""
     qdate = upcoming_trading_date.date()
-    mask = panel['timestamp'].dt.date == qdate
-    day_df = panel.loc[mask].copy()
+    panel_sorted = panel.sort_values(["symbol", "timestamp"])  # needed for rolling avg volume
+    panel_sorted["avg20_vol"] = panel_sorted.groupby("symbol")["volume"].transform(
+        lambda s: s.rolling(20, min_periods=1).mean()
+    )
+
+    mask = panel_sorted['timestamp'].dt.date == qdate
+    day_df = panel_sorted.loc[mask].copy()
     if day_df.empty:
         # Fallback: use last available block if upcoming date not present in panel yet
-        day_df = panel.tail(5000).copy()
+        day_df = panel_sorted.tail(5000).copy()
 
     X = sanitize_feature_matrix(day_df[feats].copy())
 
@@ -436,6 +511,25 @@ def build_new_watchlist(panel: pd.DataFrame, feats: list, models: dict,
     pred_ret_1d = predict_reg(models.get('m1_reg'), X)
     pred_ret_3d = predict_reg(models.get('m3_reg'), X)
     pred_ret_5d = predict_reg(models.get('m5_reg'), X)
+
+    # Std + prob for 5D (reuse predictor logic)
+    std5 = np.full(len(day_df), np.nan, dtype=float)
+    if prob_std_method == "residual" and oos5_path:
+        try:
+            oos5_df = pd.read_csv(oos5_path)
+            residual_map = _residual_std_5d(panel_sorted, oos5_df)
+            std5 = day_df["symbol"].map(residual_map).astype(float).values
+        except Exception as e:
+            print(f"[WARN] Residual std failed: {e}")
+    if np.isnan(std5).mean() > 0.5 and prob_std_method in {"residual", "symbol_hist"}:
+        sym_hist = _symbol_hist_roll_std(panel_sorted, window=int(prob_std_window), min_rows=int(prob_std_min_rows))
+        std_map2 = sym_hist.to_dict()
+        hist_std = day_df["symbol"].map(std_map2).astype(float).values
+        std5 = np.where(np.isfinite(std5), std5, hist_std)
+    if np.isnan(std5).mean() > 0.5:
+        cs = _cross_sectional_std(pred_ret_5d)
+        std5 = np.where(np.isfinite(std5), std5, cs)
+    prob_up_5d = prob_up_from_gaussian(pred_ret_5d, std5)
 
     # Empirical P(1D hits target) from calibration deciles
     p1_emp = np.array([map_prob_to_empirical(p, calib_df) for p in prob_up_1d]) if calib_df is not None else np.full(len(prob_up_1d), np.nan)
@@ -499,11 +593,13 @@ def build_new_watchlist(panel: pd.DataFrame, feats: list, models: dict,
             print(f"[WARN] Local SHAP failed: {e}")
 
     # Detailed watchlist (ladder-style)
-    out = day_df[["symbol","timestamp","close","volume"]].copy()
+    out = day_df[["symbol","timestamp","close","volume","avg20_vol"]].copy()
     out["prob_up_1d"] = prob_up_1d
     out["pred_ret_1d_pct"] = pred_ret_1d
     out["pred_ret_3d_pct"] = pred_ret_3d
     out["pred_ret_5d_pct"] = pred_ret_5d
+    out["pred_std_5d"] = std5
+    out["prob_up_5d"] = prob_up_5d
     out["inc_pred_3_over_1"] = inc_over(pred_ret_3d, pred_ret_1d)
     out["inc_pred_5_over_3"] = inc_over(pred_ret_5d, pred_ret_3d)
     out["P1_empirical"] = p1_emp
@@ -513,6 +609,11 @@ def build_new_watchlist(panel: pd.DataFrame, feats: list, models: dict,
     out["ExplainerMode"] = expl.get('mode', 'none')
     out["SHAP_or_Importances"] = ", ".join([f"{n}:{v:.3f}" for n, v in expl.get('top_features', [])])
 
+    # Liquidity screen to mirror predictor watchlist outputs
+    liquid_mask = (out["close"] >= MIN_CLOSE) & (out["avg20_vol"] >= MIN_AVG20_VOL)
+    if liquid_mask.any():
+        out = out.loc[liquid_mask].copy()
+
     # --- Compact next-day export (panel-friendly) ---
     DEFAULT_NEXTDAY_DIR.mkdir(parents=True, exist_ok=True)
     out_compact = pd.DataFrame({
@@ -520,9 +621,12 @@ def build_new_watchlist(panel: pd.DataFrame, feats: list, models: dict,
         "WC NextTradingDate": upcoming_trading_date.normalize(),  # same for all rows
         "close": out["close"],
         "volume": out["volume"],
+        "avg20_vol": out["avg20_vol"],
         "pred_ret_1d_pct": out["pred_ret_1d_pct"],
         "pred_ret_3d_pct": out["pred_ret_3d_pct"],
         "pred_ret_5d_pct": out["pred_ret_5d_pct"],
+        "pred_std_5d": out["pred_std_5d"],
+        "prob_up_5d": out["prob_up_5d"],
         "Confidence_1d_raw": out["prob_up_1d"],
         "SHAP_top": out["symbol"].map(lambda s: shap_map.get(str(s), "")),
     })

@@ -39,15 +39,18 @@ STATUS_PATH = None  # status.json heartbeat
 META_PATH = None    # model_meta.json
 
 # ===================== MODEL / CV =====================
+GLOBAL_SEED = 42
 FOLDS = 5
 EMBARGO_DAYS = 0
 # Estimators (can override via CLI)
-N_EST_ALL = 300
+N_EST_ALL = 600  # allow deeper training for higher fidelity
 N_EST_1D = N_EST_ALL
 N_EST_3D = N_EST_ALL
 N_EST_5D = N_EST_ALL
 # Early stopping
-EARLY_STOPPING_ROUNDS = 50
+EARLY_STOPPING_ROUNDS = 100
+# Learning rate shared by all LightGBM models (lower => more trees, better fit)
+LEARNING_RATE = 0.03
 # LGB shared params
 MAX_DEPTH_ALL = 8
 # Filters for watchlist
@@ -84,6 +87,9 @@ PROB_STD_WINDOW = 252
 PROB_STD_MIN_ROWS = 60
 # 1D classification margin (% absolute return treated neutral and excluded from training)
 CLS_MARGIN = 0.05
+
+# Set deterministic seed early so train/validation splits are reproducible across runs
+np.random.seed(GLOBAL_SEED)
 
 # ===================== ETA helper =====================
 class ProgressETA:
@@ -202,13 +208,13 @@ def parse_cli():
     ap.add_argument("--load-workers", type=int, default=max(1, min(8, os.cpu_count() or 1)),
         help="Parallel workers for loading/featureizing daily files (default=min(8, cores)).")
     ap.add_argument("--n-estimators-1d", type=int, default=N_EST_1D,
-        help="LightGBM trees for 1D model (default=300).")
+        help=f"LightGBM trees for 1D model (default={N_EST_1D}).")
     ap.add_argument("--n-estimators-3d", type=int, default=N_EST_3D,
-        help="LightGBM trees for 3D model (default=300).")
+        help=f"LightGBM trees for 3D model (default={N_EST_3D}).")
     ap.add_argument("--n-estimators-5d", type=int, default=N_EST_5D,
-        help="LightGBM trees for 5D model (default=300).")
+        help=f"LightGBM trees for 5D model (default={N_EST_5D}).")
     ap.add_argument("--early-stopping-rounds", type=int, default=EARLY_STOPPING_ROUNDS,
-        help="LightGBM early stopping rounds (0=disable, default=50).")
+        help=f"LightGBM early stopping rounds (0=disable, default={EARLY_STOPPING_ROUNDS}).")
     ap.add_argument("--shap-max-symbols", type=int, default=None,
         help="Cap count of symbols for SHAP after liquidity filter (optional).")
     ap.add_argument("--prob-std-method", type=str, default=PROB_STD_METHOD,
@@ -223,7 +229,7 @@ def parse_cli():
         choices=["cls", "reg", "both"],
         help="Train 1D as classification (calibrated prob), regression, or both (default=cls).")
     ap.add_argument("--cls-margin", type=float, default=CLS_MARGIN,
-        help="Neutral margin (%) around 0 for 1D classification; rows with |ret| ≤ margin are excluded.")
+        help="Neutral margin (pct) around 0 for 1D classification; rows with |ret| ≤ margin are excluded.")
     return ap.parse_args()
 
 def setup_paths(out_dir: str):
@@ -837,6 +843,30 @@ def time_cv_by_timestamp(panel: pd.DataFrame,
         if len(te_idx) > 0 and len(tr_idx) > 0:
             yield tr_idx, te_idx
 
+def split_train_val_by_time(panel: pd.DataFrame, candidate_idx: np.ndarray,
+                            val_frac: float = 0.15, min_val: int = 50) -> Tuple[np.ndarray, np.ndarray]:
+    """Deterministic time-ordered split of candidate indices into train/validation.
+
+    Keeps the most recent ``val_frac`` (at least ``min_val``) observations as validation
+    while ensuring at least half the rows remain for training. Returns empty validation
+    if the candidate pool is too small to split.
+    """
+    if candidate_idx is None:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    idx = np.asarray(candidate_idx)
+    if len(idx) < 3:
+        return idx, np.array([], dtype=idx.dtype)
+    ts = pd.to_datetime(panel.loc[idx, "timestamp"]).values
+    order = np.argsort(ts)
+    val_n = max(1, int(round(len(order) * val_frac)))
+    val_n = max(val_n, min_val)
+    val_n = min(len(order) // 2, val_n)
+    if val_n == 0:
+        return idx, np.array([], dtype=idx.dtype)
+    val_order = order[-val_n:]
+    train_order = order[:-val_n]
+    return idx[train_order], idx[val_order]
+
 # ===================== LightGBM checks =====================
 def _check_lightgbm():
     try:
@@ -879,7 +909,7 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
         depth = MAX_DEPTH_ALL if isinstance(MAX_DEPTH_ALL, int) and MAX_DEPTH_ALL > 0 else -1
         return LGBMClassifier(
             n_estimators=int(n_estimators),
-            learning_rate=0.05,
+            learning_rate=LEARNING_RATE,
             num_leaves=63,
             max_depth=depth,
             feature_fraction=0.8,
@@ -897,13 +927,20 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
         te_pos = np.where(np.isin(valid_idx, te_idx))[0]
         if len(te_pos) == 0 or len(tr_pos) == 0:
             continue
-        clf = make_lgbm(42 + fold_no)
-        X_tr = X_full.iloc[tr_pos]; y_tr = y_full[tr_pos]
+        clf = make_lgbm(GLOBAL_SEED + fold_no)
+        tr_idx_panel = valid_idx[tr_pos]
+        tr_core_idx, val_idx = split_train_val_by_time(panel, tr_idx_panel, val_frac=0.2, min_val=25)
+        tr_core_pos = np.where(np.isin(valid_idx, tr_core_idx))[0]
+        val_pos = np.where(np.isin(valid_idx, val_idx))[0]
         X_te = X_full.iloc[te_pos]; y_te = y_full[te_pos]
+        X_tr = X_full.iloc[tr_core_pos if len(tr_core_pos) > 0 else tr_pos]
+        y_tr = y_full[tr_core_pos if len(tr_core_pos) > 0 else tr_pos]
+        X_val = X_full.iloc[val_pos] if len(val_pos) > 0 else X_full.iloc[te_pos]
+        y_val = y_full[val_pos] if len(val_pos) > 0 else y_full[te_pos]
         callbacks = [lgb.callback.log_evaluation(period=0)]
         if early_stopping_rounds and early_stopping_rounds > 0:
             callbacks.insert(0, lgb.callback.early_stopping(stopping_rounds=int(early_stopping_rounds)))
-        clf.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], eval_metric="binary_logloss", callbacks=callbacks)
+        clf.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric="binary_logloss", callbacks=callbacks)
         # Calibrate on the same validation fold
         calib = _make_calibrator(clf, method="isotonic")
         calib.fit(X_te, y_te)
@@ -913,7 +950,7 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
         models.append(calib)
 
     # Final calibrated model: reserve last 20% (by time) for calibration
-    final_base = make_lgbm(1234)
+    final_base = make_lgbm(GLOBAL_SEED + 1000)
     df_valid = panel.loc[mask, ["timestamp"]].copy()
     order = np.argsort(df_valid["timestamp"].values)
     split = int(round(len(order) * 0.8))
@@ -947,7 +984,7 @@ def train_rf(panel: pd.DataFrame, feats: List[str], target_col: str, label: str,
         depth = MAX_DEPTH_ALL if isinstance(MAX_DEPTH_ALL, int) and MAX_DEPTH_ALL > 0 else -1
         return LGBMRegressor(
             n_estimators=int(n_estimators),
-            learning_rate=0.05,
+            learning_rate=LEARNING_RATE,
             num_leaves=63,
             max_depth=depth,
             feature_fraction=0.8,
@@ -965,15 +1002,20 @@ def train_rf(panel: pd.DataFrame, feats: List[str], target_col: str, label: str,
         te_pos = np.where(np.isin(valid_idx, te_idx))[0]
         if len(te_pos) == 0 or len(tr_pos) == 0:
             continue
-        gbm = make_lgbm(42 + fold_no)
-        X_tr = X_full.iloc[tr_pos]; y_tr = y_full[tr_pos]
+        gbm = make_lgbm(GLOBAL_SEED + fold_no)
+        tr_idx_panel = valid_idx[tr_pos]
+        tr_core_idx, val_idx = split_train_val_by_time(panel, tr_idx_panel, val_frac=0.2, min_val=25)
+        tr_core_pos = np.where(np.isin(valid_idx, tr_core_idx))[0]
+        val_pos = np.where(np.isin(valid_idx, val_idx))[0]
+        X_tr = X_full.iloc[tr_core_pos if len(tr_core_pos) > 0 else tr_pos]; y_tr = y_full[tr_core_pos if len(tr_core_pos) > 0 else tr_pos]
+        X_val = X_full.iloc[val_pos] if len(val_pos) > 0 else X_full.iloc[te_pos]; y_val = y_full[val_pos] if len(val_pos) > 0 else y_full[te_pos]
         X_te = X_full.iloc[te_pos]; y_te = y_full[te_pos]
         callbacks = [lgb.callback.log_evaluation(period=0)]
         if early_stopping_rounds and early_stopping_rounds > 0:
             callbacks.insert(0, lgb.callback.early_stopping(stopping_rounds=int(early_stopping_rounds)))
         gbm.fit(
             X_tr, y_tr,
-            eval_set=[(X_te, y_te)],
+            eval_set=[(X_val, y_val)],
             eval_metric="l2",
             callbacks=callbacks
         )
@@ -983,12 +1025,12 @@ def train_rf(panel: pd.DataFrame, feats: List[str], target_col: str, label: str,
         eta.tick(f"fold {fold_no} MAE={mae:.3f}% n={len(te_pos)}")
         models.append(gbm)
 
-    final = models[-1] if models else make_lgbm(1234)
+    final = models[-1] if models else make_lgbm(GLOBAL_SEED + 2000)
     if not models:
         final.fit(X_full, y_full, callbacks=[lgb.callback.log_evaluation(period=0)])
     if refit_final:
         print(f"[Train {label}] refit on ALL valid rows ...")
-        final = make_lgbm(1234)
+        final = make_lgbm(GLOBAL_SEED + 2001)
         callbacks = [lgb.callback.log_evaluation(period=0)]
         if early_stopping_rounds and early_stopping_rounds > 0:
             callbacks.insert(0, lgb.callback.early_stopping(stopping_rounds=int(early_stopping_rounds)))
