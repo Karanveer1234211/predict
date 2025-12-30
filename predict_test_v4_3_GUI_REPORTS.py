@@ -1,0 +1,1215 @@
+# UPDATED v4.3 — On-demand performance reports
+
+# ==================== ON-DEMAND PERFORMANCE REPORT ====================
+
+REPORT_WINDOWS = {
+    "1D": 1,
+    "5D": 5,
+    "1W": 7,
+    "1M": 30,
+    "3M": 90,
+    "6M": 180,
+    "1Y": 365,
+    "2Y": 730,
+    "3Y": 1095,
+    "4Y": 1460,
+    "5Y": 1825,
+}
+
+def generate_performance_report(panel, feats, models, window_days):
+    cutoff = panel["timestamp"].max() - pd.Timedelta(days=window_days)
+    df = panel[panel["timestamp"] >= cutoff].copy()
+    if df.empty:
+        return None
+
+    X = sanitize_feature_matrix(df[feats].copy())
+    p1 = predict_prob_1d(models.get("m1_cls"), X)
+    r1p = predict_reg(models.get("m1_reg"), X)
+    r3p = predict_reg(models.get("m3_reg"), X)
+    r5p = predict_reg(models.get("m5_reg"), X)
+
+    r1 = pd.to_numeric(df["ret_1d_close_pct"], errors="coerce")
+    r3 = pd.to_numeric(df["ret_3d_close_pct"], errors="coerce")
+    r5 = pd.to_numeric(df["ret_5d_close_pct"], errors="coerce")
+
+    rep = {
+        "rows": len(df),
+        "hit_1d": float((np.sign(r1p) == np.sign(r1)).mean()),
+        "hit_3d": float((np.sign(r3p) == np.sign(r3)).mean()),
+        "hit_5d": float((np.sign(r5p) == np.sign(r5)).mean()),
+        "avg_pred_1d": float(np.nanmean(r1p)),
+        "avg_real_1d": float(np.nanmean(r1)),
+        "avg_pred_3d": float(np.nanmean(r3p)),
+        "avg_real_3d": float(np.nanmean(r3)),
+        "avg_pred_5d": float(np.nanmean(r5p)),
+        "avg_real_5d": float(np.nanmean(r5)),
+    }
+    return rep
+
+# ==================== GUI: PERFORMANCE REPORT PANEL ====================
+
+def open_performance_report(panel, feats, models):
+    win = tk.Toplevel()
+    win.title("On-Demand Performance Report")
+
+    ttk.Label(win, text="Select Time Window").pack(pady=5)
+    sel = tk.StringVar(value="1M")
+    cmb = ttk.Combobox(win, values=list(REPORT_WINDOWS.keys()), textvariable=sel, state="readonly")
+    cmb.pack()
+
+    out = tk.Text(win, height=14, width=80)
+    out.pack(padx=10, pady=10)
+
+    def run_report():
+        w = REPORT_WINDOWS[sel.get()]
+        rep = generate_performance_report(panel, feats, models, w)
+        out.delete("1.0", tk.END)
+        if rep is None:
+            out.insert(tk.END, "No data available for selected window.")
+            return
+        for k, v in rep.items():
+            out.insert(tk.END, f"{k:20s}: {v:.4f}\n")
+
+    ttk.Button(win, text="Generate Report", command=run_report).pack(pady=5)
+
+# ==================== CONSOLIDATED GUI v4.2 ====================
+
+# ==================== WATCHLIST TRUST SCORE (INLINE) ====================
+# Single source of truth for action confidence (0–100)
+
+MAX_STD_5D = 0.035
+MAX_MAE_5D = -0.04
+WTS_MIN_ACT = 60
+
+def compute_health_score(nan_ratio, schema_mismatch=False, timestamp_issue=False):
+    score = 30
+    if nan_ratio > 0.05: score -= 10
+    if schema_mismatch: score -= 10
+    if timestamp_issue: score -= 10
+    return max(0, score)
+
+def compute_calibration_score(recent_brier):
+    if recent_brier <= 0.18: return 20
+    if recent_brier <= 0.22: return 14
+    if recent_brier <= 0.26: return 8
+    return 0
+
+def compute_drift_score(drift_metric):
+    if drift_metric < 0.10: return 15
+    if drift_metric < 0.20: return 8
+    return 0
+
+def compute_signal_score(prob_1d, pred_ret_1d):
+    s = 0
+    if prob_1d >= 0.60: s += 10
+    if prob_1d >= 0.70: s += 5
+    if pred_ret_1d >= 0.015: s += 5
+    return s
+
+def compute_risk_score(std_5d, mae_5d):
+    s = 15
+    if std_5d > MAX_STD_5D: s -= 8
+    if mae_5d < MAX_MAE_5D: s -= 7
+    return max(0, s)
+
+def compute_wts(row, run_ctx):
+    return (
+        run_ctx["health"]
+        + run_ctx["calibration"]
+        + run_ctx["drift"]
+        + compute_signal_score(row["prob_up_1d"], row["pred_ret_1d_pct"])
+        + compute_risk_score(row.get("std5", 0), row.get("mae_5d_pct", 0))
+    )
+
+# ==================== PIPELINE HEALTH GATE ====================
+def pipeline_is_healthy(X):
+    nan_ratio = X.isna().mean().mean()
+    if nan_ratio > 0.10:
+        return False, nan_ratio
+    return True, nan_ratio
+
+# ==================== CONTINUOUS MONITORING ====================
+def record_run_metrics(run_ctx, save_dir):
+    rec = {
+        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+        "health": run_ctx["health"],
+        "calibration": run_ctx["calibration"],
+        "drift": run_ctx["drift"]
+    }
+    p = Path(save_dir) / "model_health_log.jsonl"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+# UPDATED v4.1 — WTS enabled
+
+# -------- WATCHLIST TRUST SCORE (WTS) --------
+from watchlist_trust_score import (
+    compute_health_score,
+    compute_calibration_score,
+    compute_drift_score,
+    compute_watchlist_trust_score,
+    is_trustworthy
+)
+
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Daily Metrics GUI (v4.0, NSE-aware) — Back-test + New Watchlist + Exchange calendar
+-----------------------------------------------------------------------------------
+What you get:
+- Back-test: per-day processing + incremental ladder stats + empirical calibration.
+- New Watchlist: predictions, conversion odds, ImmediatePickScore, carry-forward lists,
+  AND a compact 'watchlist_nextday.(csv|xlsx)' with WC NextTradingDate (NSE).
+- Optional: probability calibrator (pickle) & per-symbol local SHAP strings (top-k).
+- Auto-picks file 'watchlist_nextday_picks.csv' using recommended thresholds:
+    Confidence >= 0.60 (calibrated if available else raw) AND pred_ret_1d_pct >= 0.015
+
+Recommended defaults in this script:
+- Targets T1/T3/T5 = 2.0 (%)
+- min_prob_1d = 0.60
+- local SHAP enabled with top-k = 3
+- Use NSE holiday calendar to compute true NextTradingDate
+
+NOTE: Update NSE_HOLIDAYS_2025 every January when NSE posts the new calendar.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import pandas as pd
+import numpy as np
+import json
+import joblib
+import datetime as dt
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Sequence, Set
+
+# -------------------- Defaults --------------------
+DEFAULT_M1CLS = r"C:\\Users\\karanvsi\\PyCharmMiscProject\\model_1d_cls_calib.joblib"
+DEFAULT_M3REG = r"C:\\Users\\karanvsi\\PyCharmMiscProject\\model_3d_rf.joblib"
+DEFAULT_M5REG = r"C:\\Users\\karanvsi\\PyCharmMiscProject\\model_5d_rf.joblib"
+DEFAULT_PANEL_DIR = r"C:\\Users\\karanvsi\\PyCharmMiscProject\\panel_by_year"
+
+# Compact next-day export & picks
+DEFAULT_NEXTDAY_DIR = Path.home() / "Desktop" / "Kite Connect" / "NextDay Watchlist"
+DEFAULT_TOPK = 3  # SHAP top-k (local per symbol)
+# Picks thresholds (can be tuned)
+PICKS_CONF_MIN = 0.60
+PICKS_PRED1D_MIN = 0.015  # +1.5%
+# Liquidity filter (stay in sync with predictor defaults)
+MIN_CLOSE = 50.0
+MIN_AVG20_VOL = 200_000
+
+# Probability std controls for 5D odds (mirrors predictor.py)
+PROB_STD_METHOD = "residual"
+PROB_STD_WINDOW = 252
+PROB_STD_MIN_ROWS = 60
+
+# -------------------- NSE holiday calendar (2025) --------------------
+# Update this list annually from NSE holiday page/circulars.
+NSE_HOLIDAYS_2025: Set[pd.Timestamp] = set(pd.to_datetime(d) for d in [
+    "2025-02-26",  # Mahashivratri
+    "2025-03-14",  # Holi
+    "2025-03-31",  # Id-Ul-Fitr (Ramadan Eid)
+    "2025-04-10",  # Shri Mahavir Jayanti
+    "2025-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2025-04-18",  # Good Friday
+    "2025-05-01",  # Maharashtra Day
+    "2025-08-15",  # Independence Day
+    "2025-08-27",  # Ganesh Chaturthi
+    "2025-10-02",  # Mahatma Gandhi Jayanti / Dussehra
+    "2025-10-21",  # Diwali Laxmi Pujan (Muhurat – evening session only)
+    "2025-10-22",  # Diwali Balipratipada
+    "2025-11-05",  # Guru Nanak Jayanti
+    "2025-12-25",  # Christmas
+])
+
+def next_trading_date(start_date: pd.Timestamp, holidays: Set[pd.Timestamp]) -> pd.Timestamp:
+    """Return the next NSE trading date after start_date (skip Sat/Sun & official holidays)."""
+    d = start_date + pd.Timedelta(days=1)
+    while d.weekday() >= 5 or d.normalize() in holidays:  # 5=Sat, 6=Sun
+        d += pd.Timedelta(days=1)
+    return d.normalize()
+
+# -------------------- Helpers --------------------
+def sanitize_feature_matrix(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    for c in X.columns:
+        if X[c].dtype == bool:
+            X[c] = X[c].astype(int)
+        elif X[c].dtype == object:
+            s = X[c].astype(str).str.lower()
+            uniq = set(s.unique())
+            if uniq <= {"true", "false", "nan"}:
+                X[c] = s.map({"true": 1, "false": 0}).astype("Int64").fillna(0).astype(int)
+            else:
+                X[c] = pd.to_numeric(X[c], errors="coerce")
+        if c.startswith(("CPR_Yday_", "CPR_Tmr_", "Struct_", "DayType_")):
+            X[c] = X[c].fillna(0).astype(int)
+    return X
+
+def feature_columns_from_panel(panel: pd.DataFrame) -> List[str]:
+    cols = list(panel.columns)
+    feats = [c for c in cols if (
+        c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_") or
+        c.startswith("Struct_") or c.startswith("DayType_")
+    )]
+    return feats
+
+def load_model(path_str: str):
+    if not path_str:
+        return None
+    p = Path(path_str)
+    if not p.exists():
+        return None
+    try:
+        return joblib.load(p)
+    except Exception as e:
+        print(f"[WARN] Failed to load {p}: {e}")
+        return None
+
+def predict_prob_1d(model, X_df):
+    if model is None:
+        return np.full(len(X_df), np.nan)
+    try:
+        proba = model.predict_proba(X_df)[:, 1]
+        return proba
+    except Exception:
+        try:
+            raw = model.predict(X_df)
+            return 1/(1+np.exp(-np.clip(raw, -10, 10)))
+        except Exception:
+            return np.full(len(X_df), np.nan)
+
+def predict_reg(model, X_df):
+    if model is None:
+        return np.full(len(X_df), np.nan)
+    try:
+        it = getattr(model, "best_iteration_", None)
+        return model.predict(X_df, num_iteration=it)
+    except Exception:
+        try:
+            return model.predict(X_df)
+        except Exception:
+            return np.full(len(X_df), np.nan)
+
+def hit_rate(expected, delivered):
+    mask = np.isfinite(expected) & np.isfinite(delivered)
+    if mask.sum() == 0: return float('nan')
+    return float((np.sign(expected[mask]) == np.sign(delivered[mask])).mean())
+
+def wilson_ci(p_hat, n, z=1.96):
+    if n <= 0: return (np.nan, np.nan)
+    center = (p_hat + z*z/(2*n)) / (1 + z*z/n)
+    half = z*np.sqrt(p_hat*(1-p_hat)/n + z*z/(4*n*n)) / (1 + z*z/n)
+    return (center - half, center + half)
+
+def read_panel_from_dir(panel_dir: Path) -> pd.DataFrame:
+    files = sorted(list(panel_dir.glob('*.parquet')))
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {panel_dir}")
+    dfs = [pd.read_parquet(f) for f in files]
+    panel = pd.concat(dfs, ignore_index=True)
+    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
+    panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
+    return panel
+
+def inc_over(a, b):
+    """Return incremental (1+a)/(1+b) - 1, robust to NaN."""
+    a = np.nan_to_num(a, nan=np.nan)
+    b = np.nan_to_num(b, nan=np.nan)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return (1.0 + a) / (1.0 + b) - 1.0
+
+# -------------------- Probability helpers (match predictor) --------------------
+def _phi_approx(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=float)
+    out = np.empty_like(z, dtype=float)
+    pos_inf = np.isposinf(z); neg_inf = np.isneginf(z)
+    out[pos_inf] = 1.0
+    out[neg_inf] = 0.0
+    finite = np.isfinite(z)
+    if np.any(finite):
+        x = z[finite]
+        t = 1.0 / (1.0 + 0.2316419 * np.abs(x))
+        a1, a2, a3, a4, a5 = 0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429
+        poly = ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+        nd = (1.0 / np.sqrt(2.0*np.pi)) * np.exp(-0.5 * x*x)
+        approx = 1.0 - nd * poly
+        out[finite] = np.where(x >= 0, approx, 1.0 - approx)
+    return out
+
+def prob_up_from_gaussian(mean, std):
+    mean = np.asarray(mean, dtype=float)
+    std = np.asarray(std, dtype=float)
+    safe_std = np.where(np.isfinite(std) & (std > 0), std, np.nan)
+    z = np.divide(mean, safe_std, where=np.isfinite(safe_std))
+    prob = _phi_approx(z)
+    prob = np.where(np.isfinite(prob), prob, np.where(mean >= 0, 1.0, 0.0))
+    return prob
+
+def _cross_sectional_std(values: np.ndarray, floor: float = 1e-6) -> float:
+    s = float(np.nanstd(values))
+    return s if np.isfinite(s) and s > floor else 1.0
+
+def _symbol_hist_roll_std(panel: pd.DataFrame, window: int, min_rows: int) -> pd.Series:
+    df = panel.sort_values(["symbol","timestamp"])
+    grp = df.groupby("symbol", sort=False)
+    roll = grp["ret_5d_close_pct"].apply(lambda x: pd.to_numeric(x, errors="coerce").rolling(window, min_periods=min_rows).std())
+    df2 = df.copy()
+    df2["roll_std_5d"] = roll.values
+    last = df2.groupby("symbol", as_index=True)["roll_std_5d"].tail(1)
+    return last
+
+def _residual_std_5d(panel: pd.DataFrame, oos5_df: pd.DataFrame) -> Dict[str, float]:
+    if oos5_df is None or oos5_df.empty:
+        return {}
+    idx = oos5_df.get("panel_idx")
+    pred = oos5_df.get("oos_pred")
+    if idx is None or pred is None:
+        return {}
+    idx = pd.to_numeric(idx, errors="coerce").astype(int).values
+    pred = pd.to_numeric(pred, errors="coerce").values
+    in_panel = np.isin(idx, panel.index.values)
+    idx = idx[in_panel]; pred = pred[in_panel]
+    reals = pd.to_numeric(panel.loc[idx, "ret_5d_close_pct"], errors="coerce").values
+    syms = panel.loc[idx, "symbol"].values
+    resid = reals - pred
+    df = pd.DataFrame({"symbol": syms, "resid": resid})
+    stds = df.groupby("symbol")["resid"].std().to_dict()
+    return {k: float(v) for k, v in stds.items() if np.isfinite(v) and v > 1e-6}
+
+# -------------------- SHAP (global + per-symbol local, optional) --------------------
+def compute_shap_or_importance(model, X_df, feature_names):
+    """Global explanation: top features over the batch; local top for row 0 (if available)."""
+    try:
+        import shap
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_df)
+        sv = shap_values if isinstance(shap_values, np.ndarray) else shap_values[0]
+        abs_mean = np.nanmean(np.abs(sv), axis=0)
+        order = np.argsort(abs_mean)[::-1]
+        top_idx = order[:5]
+        top_feats = [(feature_names[i], float(abs_mean[i])) for i in top_idx]
+        local = None
+        if len(X_df) > 0:
+            row_sv = sv[0]
+            local = sorted([(feature_names[i], float(row_sv[i])) for i in range(len(feature_names))],
+                           key=lambda t: abs(t[1]), reverse=True)[:5]
+        return {'mode': 'shap', 'top_features': top_feats, 'local_top': local}
+    except Exception:
+        imp = getattr(model, 'feature_importances_', None)
+        if imp is None:
+            return {'mode': 'none', 'top_features': [], 'local_top': None}
+        arr = np.array(imp)
+        order = np.argsort(arr)[::-1]
+        top_idx = order[:5]
+        top_feats = [(feature_names[i], float(arr[i])) for i in top_idx]
+        return {'mode': 'importances', 'top_features': top_feats, 'local_top': None}
+
+def compute_local_shap_strings(model, X_df, symbols: Sequence, topk: int) -> Dict[str, str]:
+    """Per-symbol local SHAP strings: 'feat1 +0.12, feat2 -0.08, ...'"""
+    try:
+        import shap
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_df)
+        sv = shap_values if isinstance(shap_values, np.ndarray) else shap_values[0]
+        fnames = list(X_df.columns)
+        out = {}
+        for i in range(len(X_df)):
+            pairs = list(zip(fnames, sv[i]))
+            pairs.sort(key=lambda x: abs(x[1]), reverse=True)
+            s = ", ".join([f"{n} {v:+.2f}" for n, v in pairs[:topk]])
+            out[str(symbols[i])] = s
+        return out
+    except Exception:
+        return {}
+
+# -------------------- Back-test (existing behavior) --------------------
+def process_one_date(panel: pd.DataFrame, feats: list, models: dict, date_str: str,
+                     min_prob_1d: float, save_dir: Path):
+    qdate = pd.to_datetime(date_str).date()
+    mask = panel["timestamp"].dt.date == qdate
+    day_df = panel.loc[mask].copy()
+    if day_df.empty:
+        return {"date": date_str, "rows": 0, "hit_rate_1d": float('nan'),
+                "hit_rate_3d": float('nan'), "hit_rate_5d": float('nan'),
+                "csv": None, "note": "No rows for date"}
+
+    X = sanitize_feature_matrix(day_df[feats].copy())
+    prob_up_1d = predict_prob_1d(models.get('m1_cls'), X)
+    pred_ret_1d = predict_reg(models.get('m1_reg'), X)
+    pred_ret_3d = predict_reg(models.get('m3_reg'), X)
+    pred_ret_5d = predict_reg(models.get('m5_reg'), X)
+
+    r1 = pd.to_numeric(day_df.get("ret_1d_close_pct"), errors="coerce").values
+    r3 = pd.to_numeric(day_df.get("ret_3d_close_pct"), errors="coerce").values
+    r5 = pd.to_numeric(day_df.get("ret_5d_close_pct"), errors="coerce").values
+
+    expected_1d = np.where(np.isfinite(prob_up_1d),
+                           np.where(prob_up_1d >= float(min_prob_1d), 1.0, -1.0),
+                           pred_ret_1d)
+    expected_3d = pred_ret_3d
+    expected_5d = pred_ret_5d
+
+    hr1 = hit_rate(expected_1d, r1)
+    hr3 = hit_rate(expected_3d, r3)
+    hr5 = hit_rate(expected_5d, r5)
+
+    out = day_df[["symbol","timestamp","close","volume"]].copy()
+    out["prob_up_1d"] = prob_up_1d
+    out["pred_ret_1d_pct"] = pred_ret_1d
+    out["pred_ret_3d_pct"] = pred_ret_3d
+    out["pred_ret_5d_pct"] = pred_ret_5d
+    out["real_ret_1d_pct"] = r1
+    out["real_ret_3d_pct"] = r3
+    out["real_ret_5d_pct"] = r5
+
+    out["inc_real_3_over_1"] = inc_over(out["real_ret_3d_pct"], out["real_ret_1d_pct"])
+    out["inc_real_5_over_3"] = inc_over(out["real_ret_5d_pct"], out["real_ret_3d_pct"])
+    out["inc_pred_3_over_1"] = inc_over(out["pred_ret_3d_pct"], out["pred_ret_1d_pct"])
+    out["inc_pred_5_over_3"] = inc_over(out["pred_ret_5d_pct"], out["pred_ret_3d_pct"])
+
+    ts_suffix = dt.datetime.now().strftime("%H%M%S")
+    out_path = save_dir / f"daily_metrics_{date_str}_{ts_suffix}.csv"
+    out.to_csv(out_path, index=False)
+    return {"date": date_str, "rows": int(len(out)), "hit_rate_1d": hr1,
+            "hit_rate_3d": hr3, "hit_rate_5d": hr5, "csv": str(out_path)}
+
+# -------------------- Ladder stats + empirical calibration --------------------
+def decile_edges():
+    return np.linspace(0.0, 1.0, 11)
+
+def ladder_stats_incremental(df: pd.DataFrame, tgt1=2.0, tgt3=2.0, tgt5=2.0):
+    d = df.copy()
+    for c in ["prob_up_1d","real_ret_1d_pct","real_ret_3d_pct","real_ret_5d_pct",
+              "inc_real_3_over_1","inc_real_5_over_3"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors='coerce')
+
+    hit1 = d['real_ret_1d_pct'] >= tgt1
+    inc3 = d['inc_real_3_over_1'] >= tgt3
+    inc5 = d['inc_real_5_over_3'] >= tgt5
+
+    p1 = float(hit1.mean()) if len(d) else np.nan
+    p3g1 = float((inc3[hit1]).mean()) if hit1.any() else np.nan
+    p5g3 = float((inc5[inc3 & hit1]).mean()) if (inc3 & hit1).any() else np.nan
+
+    overall = {
+        'n_all': int(len(d)),
+        'p_1d_hit': p1,
+        'n_1d_hit': int(hit1.sum()),
+        'p_inc3_given_1d': p3g1,
+        'n_for_inc3_given_1d': int((hit1 & d['inc_real_3_over_1'].notna()).sum()),
+        'p_inc5_given_3_and_1': p5g3,
+        'n_for_inc5_given_3_and_1': int((hit1 & inc3 & d['inc_real_5_over_3'].notna()).sum()),
+    }
+
+    edges = decile_edges()
+    rows = []
+    for i in range(10):
+        lo, hi = float(edges[i]), float(edges[i+1])
+        b = d[(d['prob_up_1d'] >= lo) & (d['prob_up_1d'] < hi)]
+        if len(b) == 0:
+            rows.append({'bucket': f'[{lo:.1f},{hi:.1f}]', 'n_all': 0,
+                         'p_1d_hit': np.nan, 'p_inc3_given_1d': np.nan,
+                         'p_inc5_given_3_and_1': np.nan})
+            continue
+        h1b = b['real_ret_1d_pct'] >= tgt1
+        inc3b = b['inc_real_3_over_1'] >= tgt3
+        inc5b = b['inc_real_5_over_3'] >= tgt5
+        rows.append({
+            'bucket': f'[{lo:.1f},{hi:.1f}]',
+            'n_all': int(len(b)),
+            'p_1d_hit': float(h1b.mean()),
+            'p_inc3_given_1d': float((inc3b[h1b]).mean()) if h1b.any() else np.nan,
+            'p_inc5_given_3_and_1': float((inc5b[inc3b & h1b]).mean()) if (inc3b & h1b).any() else np.nan,
+        })
+    return overall, pd.DataFrame(rows)
+
+def build_prob_calibration(df: pd.DataFrame, tgt1=2.0):
+    d = df.copy()
+    for c in ["prob_up_1d","real_ret_1d_pct"]:
+        d[c] = pd.to_numeric(d[c], errors='coerce')
+    d = d[d['real_ret_1d_pct'].notna() & d['prob_up_1d'].notna()]
+    edges = decile_edges()
+    out = []
+    for i in range(10):
+        lo, hi = float(edges[i]), float(edges[i+1])
+        b = d[(d['prob_up_1d'] >= lo) & (d['prob_up_1d'] < hi)]
+        n = len(b)
+        if n == 0:
+            out.append({'lo': lo, 'hi': hi, 'p': np.nan, 'n': 0, 'ci_low': np.nan, 'ci_high': np.nan})
+            continue
+        p = float((b['real_ret_1d_pct'] >= tgt1).mean())
+        ci_low, ci_high = wilson_ci(p, n)
+        out.append({'lo': lo, 'hi': hi, 'p': p, 'n': n, 'ci_low': ci_low, 'ci_high': ci_high})
+    calib = pd.DataFrame(out)
+    return calib
+
+def map_prob_to_empirical(prob: float, calib_df: pd.DataFrame) -> float:
+    if not np.isfinite(prob) or calib_df is None or calib_df.empty:
+        return np.nan
+    for _, r in calib_df.iterrows():
+        if prob >= r['lo'] and prob < r['hi']:
+            return float(r['p']) if np.isfinite(r['p']) else np.nan
+    last = calib_df.iloc[-1]
+    if prob >= last['lo']:
+        return float(last['p']) if np.isfinite(last['p']) else np.nan
+    return np.nan
+
+# -------------------- Train follow-through models (3↦1 and 5↦3) --------------------
+def train_follow_through_models(panel: pd.DataFrame, feats: list,
+                                start_date: dt.date, end_date: dt.date,
+                                tgt1=2.0, tgt3=2.0, tgt5=2.0, alpha_tol=0.8):
+    from sklearn.ensemble import RandomForestClassifier
+
+    rows = []
+    cur = start_date
+    while cur <= end_date:
+        mask = panel['timestamp'].dt.date == cur
+        day_df = panel.loc[mask]
+        if len(day_df) == 0:
+            cur += dt.timedelta(days=1)
+            continue
+
+        X = sanitize_feature_matrix(day_df[feats].copy())
+        m1 = load_model(DEFAULT_M1CLS)
+        m3 = load_model(DEFAULT_M3REG)
+        m5 = load_model(DEFAULT_M5REG)
+        prob_up_1d = predict_prob_1d(m1, X) if m1 else predict_prob_1d(None, X)
+
+        r1 = pd.to_numeric(day_df.get("ret_1d_close_pct"), errors='coerce').values
+        r3 = pd.to_numeric(day_df.get("ret_3d_close_pct"), errors='coerce').values
+        r5 = pd.to_numeric(day_df.get("ret_5d_close_pct"), errors='coerce').values
+
+        inc3 = inc_over(r3, r1)
+        inc5 = inc_over(r5, r3)
+
+        df2 = pd.DataFrame({
+            'symbol': day_df['symbol'].values,
+            'timestamp': day_df['timestamp'].values,
+            'prob_up_1d': prob_up_1d,
+            'ret_1d': r1, 'ret_3d': r3, 'ret_5d': r5,
+            'inc_real_3_over_1': inc3,
+            'inc_real_5_over_3': inc5
+        })
+        rows.append(pd.concat([df2, X.reset_index(drop=True)], axis=1))
+        cur += dt.timedelta(days=1)
+
+    if len(rows) == 0:
+        return None, None
+
+    hist = pd.concat(rows, ignore_index=True)
+    hit1 = hist['ret_1d'] >= tgt1
+    inc3_hit = hist['inc_real_3_over_1'] >= tgt3
+    inc5_hit = hist['inc_real_5_over_3'] >= tgt5
+
+    feat_mat = sanitize_feature_matrix(hist[feats].copy()).fillna(0)
+    feat_mat = feat_mat.copy()
+    feat_mat['Hit_1D'] = hit1.astype(int)
+    feat_mat['Inc3_Hit'] = inc3_hit.astype(int)
+
+    # Model for 3↦1: train on rows where Hit_1D=True
+    mask3 = hit1 & hist['inc_real_3_over_1'].notna()
+    X3 = feat_mat.loc[mask3]
+    y3 = inc3_hit.loc[mask3].astype(int)
+    model_conv3 = None
+    if len(X3) > 50 and y3.nunique() > 1:
+        model_conv3 = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42)
+        model_conv3.fit(X3, y3)
+
+    # Model for 5↦3: train on rows where Hit_1D & Inc3_Hit=True and inc5 notna
+    mask5 = hit1 & inc3_hit & hist['inc_real_5_over_3'].notna()
+    X5 = feat_mat.loc[mask5]
+    y5 = inc5_hit.loc[mask5].astype(int)
+    model_conv5 = None
+    if len(X5) > 50 and y5.nunique() > 1:
+        model_conv5 = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42)
+        model_conv5.fit(X5, y5)
+
+    return model_conv3, model_conv5
+
+# -------------------- New Watchlist + Compact NextDay export --------------------
+def build_new_watchlist(panel: pd.DataFrame, feats: list, models: dict,
+                        upcoming_trading_date: pd.Timestamp,
+                        calib_df: Optional[pd.DataFrame],
+                        conv_df: Optional[pd.DataFrame],
+                        save_dir: Path, tgt1=2.0, tgt3=2.0, tgt5=2.0,
+                        model_conv3=None, model_conv5=None,
+                        calibrator_pickle: Optional[str] = None,
+                        use_local_shap: bool = True,
+                        shap_topk: int = DEFAULT_TOPK,
+                        prob_std_method: str = PROB_STD_METHOD,
+                        prob_std_window: int = PROB_STD_WINDOW,
+                        prob_std_min_rows: int = PROB_STD_MIN_ROWS,
+                        oos5_path: Optional[str] = None):
+    """Build detailed watchlist + compact next-day export + picks."""
+    qdate = upcoming_trading_date.date()
+    panel_sorted = panel.sort_values(["symbol", "timestamp"])  # needed for rolling avg volume
+    panel_sorted["avg20_vol"] = panel_sorted.groupby("symbol")["volume"].transform(
+        lambda s: s.rolling(20, min_periods=1).mean()
+    )
+
+    mask = panel_sorted['timestamp'].dt.date == qdate
+    day_df = panel_sorted.loc[mask].copy()
+    if day_df.empty:
+        # Fallback: use last available block if upcoming date not present in panel yet
+        day_df = panel_sorted.tail(5000).copy()
+
+    X = sanitize_feature_matrix(day_df[feats].copy())
+
+    prob_up_1d = predict_prob_1d(models.get('m1_cls'), X)
+    pred_ret_1d = predict_reg(models.get('m1_reg'), X)
+    pred_ret_3d = predict_reg(models.get('m3_reg'), X)
+    pred_ret_5d = predict_reg(models.get('m5_reg'), X)
+
+    # Std + prob for 5D (reuse predictor logic)
+    std5 = np.full(len(day_df), np.nan, dtype=float)
+    if prob_std_method == "residual" and oos5_path:
+        try:
+            oos5_df = pd.read_csv(oos5_path)
+            residual_map = _residual_std_5d(panel_sorted, oos5_df)
+            std5 = day_df["symbol"].map(residual_map).astype(float).values
+        except Exception as e:
+            print(f"[WARN] Residual std failed: {e}")
+    if np.isnan(std5).mean() > 0.5 and prob_std_method in {"residual", "symbol_hist"}:
+        sym_hist = _symbol_hist_roll_std(panel_sorted, window=int(prob_std_window), min_rows=int(prob_std_min_rows))
+        std_map2 = sym_hist.to_dict()
+        hist_std = day_df["symbol"].map(std_map2).astype(float).values
+        std5 = np.where(np.isfinite(std5), std5, hist_std)
+    if np.isnan(std5).mean() > 0.5:
+        cs = _cross_sectional_std(pred_ret_5d)
+        std5 = np.where(np.isfinite(std5), std5, cs)
+    prob_up_5d = prob_up_from_gaussian(pred_ret_5d, std5)
+
+    # Empirical P(1D hits target) from calibration deciles
+    p1_emp = np.array([map_prob_to_empirical(p, calib_df) for p in prob_up_1d]) if calib_df is not None else np.full(len(prob_up_1d), np.nan)
+    p1_emp = np.where(np.isfinite(p1_emp), p1_emp, prob_up_1d)
+
+    # Conversion mapping by prob buckets for 3↦1 (proxy if models not present)
+    def conv_inc3_from_prob(prob):
+        if conv_df is None or conv_df.empty:
+            return np.nan
+
+        def parse_bucket(b: str) -> tuple:
+            # Robust bucket parser: handles "[lo,hi]" or "(lo,hi)"
+            s = str(b).strip()
+            if s and s[0] in '([' and s[-1] in ')]':
+                s = s[1:-1]  # drop outer bracket
+            parts = s.split(',')
+            if len(parts) != 2:
+                return (np.nan, np.nan)
+            try:
+                lo = float(parts[0].strip())
+                hi = float(parts[1].strip())
+                return (lo, hi)
+            except Exception:
+                return (np.nan, np.nan)
+
+        for _, r in conv_df.iterrows():
+            lo, hi = parse_bucket(r['bucket'])
+            if np.isfinite(lo) and np.isfinite(hi) and (prob >= lo) and (prob < hi):
+                return float(r.get('p_inc3_given_1d', np.nan))
+
+        # Fallback: if no matching bucket, use the last bucket's value
+        last = conv_df.iloc[-1]
+        return float(last.get('p_inc3_given_1d', np.nan))
+
+    p3_conv = np.array([conv_inc3_from_prob(p) for p in prob_up_1d])
+
+    # Immediate pick score for D+1 (weights recommended)
+    k = 0.7
+    mom_context = np.zeros(len(day_df))     # hook actual momentum context if available
+    quality     = np.ones(len(day_df))
+    overext     = np.zeros(len(day_df))
+    score_d1 = (0.50 * p1_emp
+                + 0.25 * (1/(1+np.exp(-k * np.nan_to_num(pred_ret_1d))))
+                + 0.15 * mom_context
+                + 0.10 * quality
+                - 0.10 * overext)
+
+    # Next-2-day hit odds
+    p_next2 = 1 - (1 - np.clip(p1_emp, 0, 1)) * (1 - np.clip(p3_conv, 0, 1))
+
+    # Global explanations
+    feature_names = list(X.columns)
+    expl = compute_shap_or_importance(models.get('m3_reg') or models.get('m1_cls'), X, feature_names)
+
+    # **Per-symbol local SHAP** strings (optional)
+    shap_map = {}
+    if use_local_shap and models.get('m1_cls') is not None:
+        try:
+            shap_map = compute_local_shap_strings(models.get('m1_cls'), X, day_df["symbol"].values, shap_topk)
+        except Exception as e:
+            print(f"[WARN] Local SHAP failed: {e}")
+
+    # Detailed watchlist (ladder-style)
+    out = day_df[["symbol","timestamp","close","volume","avg20_vol"]].copy()
+    out["prob_up_1d"] = prob_up_1d
+    out["pred_ret_1d_pct"] = pred_ret_1d
+    out["pred_ret_3d_pct"] = pred_ret_3d
+    out["pred_ret_5d_pct"] = pred_ret_5d
+    out["pred_std_5d"] = std5
+    out["prob_up_5d"] = prob_up_5d
+    out["inc_pred_3_over_1"] = inc_over(pred_ret_3d, pred_ret_1d)
+    out["inc_pred_5_over_3"] = inc_over(pred_ret_5d, pred_ret_3d)
+    out["P1_empirical"] = p1_emp
+    out["P_inc3_given_1_empirical"] = p3_conv
+    out["ImmediatePickScore_D1"] = score_d1
+    out["P_hit_next_2d"] = p_next2
+    out["ExplainerMode"] = expl.get('mode', 'none')
+    out["SHAP_or_Importances"] = ", ".join([f"{n}:{v:.3f}" for n, v in expl.get('top_features', [])])
+
+    # Liquidity screen to mirror predictor watchlist outputs
+    liquid_mask = (out["close"] >= MIN_CLOSE) & (out["avg20_vol"] >= MIN_AVG20_VOL)
+    if liquid_mask.any():
+        out = out.loc[liquid_mask].copy()
+
+    # --- Compact next-day export (panel-friendly) ---
+    DEFAULT_NEXTDAY_DIR.mkdir(parents=True, exist_ok=True)
+    out_compact = pd.DataFrame({
+        "symbol": out["symbol"],
+        "WC NextTradingDate": upcoming_trading_date.normalize(),  # same for all rows
+        "close": out["close"],
+        "volume": out["volume"],
+        "avg20_vol": out["avg20_vol"],
+        "pred_ret_1d_pct": out["pred_ret_1d_pct"],
+        "pred_ret_3d_pct": out["pred_ret_3d_pct"],
+        "pred_ret_5d_pct": out["pred_ret_5d_pct"],
+        "pred_std_5d": out["pred_std_5d"],
+        "prob_up_5d": out["prob_up_5d"],
+        "Confidence_1d_raw": out["prob_up_1d"],
+        "SHAP_top": out["symbol"].map(lambda s: shap_map.get(str(s), "")),
+    })
+
+    # Optional calibrator (Platt / Isotonic)
+    calibrated = None
+    if calibrator_pickle:
+        try:
+            calibrator = joblib.load(calibrator_pickle)
+            probs = out_compact["Confidence_1d_raw"].to_numpy()
+            if probs.ndim == 1:
+                arr = probs.reshape(-1, 1)
+            else:
+                arr = probs
+            out_compact["Confidence_1d_calib"] = calibrator.predict_proba(arr)[:, 1]
+            calibrated = out_compact["Confidence_1d_calib"].to_numpy()
+        except Exception as e:
+            print(f"[WARN] Calibration failed: {e}")
+
+    # Save compact
+    compact_csv = DEFAULT_NEXTDAY_DIR / "watchlist_nextday.csv"
+    compact_xlsx = DEFAULT_NEXTDAY_DIR / "watchlist_nextday.xlsx"
+    out_compact.to_csv(compact_csv, index=False)
+    try:
+        out_compact.to_excel(compact_xlsx, index=False, engine="openpyxl")
+    except Exception as e:
+        print(f"[WARN] Excel write failed ({e}); CSV saved.")
+
+    # Auto-picks subset using recommended thresholds
+    conf_for_filter = calibrated if calibrated is not None else out_compact["Confidence_1d_raw"].to_numpy()
+    mask_picks = (conf_for_filter >= PICKS_CONF_MIN) & (out_compact["pred_ret_1d_pct"].to_numpy() >= PICKS_PRED1D_MIN)
+    picks_df = out_compact.loc[mask_picks].copy().sort_values(
+        by=["Confidence_1d_calib" if "Confidence_1d_calib" in out_compact.columns else "Confidence_1d_raw",
+            "pred_ret_1d_pct"],
+        ascending=[False, False]
+    )
+    picks_path = DEFAULT_NEXTDAY_DIR / "watchlist_nextday_picks.csv"
+    picks_df.to_csv(picks_path, index=False)
+
+    # Detailed & carry-forward files
+    ts_suffix = dt.datetime.now().strftime("%H%M%S")
+    detailed_path = save_dir / f"watchlist_ladder_{qdate}_{ts_suffix}.csv"
+    out.sort_values(["ImmediatePickScore_D1", "P_hit_next_2d"], ascending=[False, False]).to_csv(detailed_path, index=False)
+
+    # Carry-forward lists from the most recent completed day
+    latest_date = panel['timestamp'].dt.date.max()
+    latest_mask = panel['timestamp'].dt.date == latest_date
+    latest_df = panel.loc[latest_mask].copy()
+    cfA_path = None
+    cfB_path = None
+    if len(latest_df) > 0:
+        X_latest = sanitize_feature_matrix(latest_df[feats].copy())
+        r1 = pd.to_numeric(latest_df.get("ret_1d_close_pct"), errors='coerce')
+        r3 = pd.to_numeric(latest_df.get("ret_3d_close_pct"), errors='coerce')
+        r5 = pd.to_numeric(latest_df.get("ret_5d_close_pct"), errors='coerce')
+        inc3 = inc_over(r3, r1); inc5 = inc_over(r5, r3)
+
+        p1 = predict_reg(models.get('m1_reg'), X_latest)
+        p3 = predict_reg(models.get('m3_reg'), X_latest)
+        p5 = predict_reg(models.get('m5_reg'), X_latest)
+        inc_pred_3_over_1 = inc_over(p3, p1)
+        inc_pred_5_over_3 = inc_over(p5, p3)
+
+        # Carry-forward A: Hit 1D → likely upcoming 3D/5D
+        hit1_flag = (r1 >= tgt1)
+        cfA = latest_df[["symbol","timestamp","close","volume"]].copy()
+        cfA["Hit_1D"] = hit1_flag.astype(int)
+        cfA["inc_pred_3_over_1"] = np.array(inc_pred_3_over_1)
+        cfA["inc_pred_5_over_3"] = np.array(inc_pred_5_over_3)
+        if model_conv3 is not None:
+            X_latest_ft3 = X_latest.copy().assign(Hit_1D=hit1_flag.astype(int))
+            try:
+                p_ft3 = model_conv3.predict_proba(X_latest_ft3)[:, 1]
+            except Exception:
+                raw = model_conv3.predict(X_latest_ft3)
+                p_ft3 = 1/(1+np.exp(-np.clip(raw, -10, 10)))
+            cfA["ConvProb_Inc3↦1_model"] = p_ft3
+            expl3 = compute_shap_or_importance(model_conv3, X_latest_ft3, list(X_latest_ft3.columns))
+            cfA["SHAP_FT3_Top"] = ", ".join([f"{n}:{v:.3f}" for n, v in expl3.get('top_features', [])])
+        else:
+            cfA["ConvProb_Inc3↦1_model"] = np.nan
+            cfA["SHAP_FT3_Top"] = ""
+        cfA = cfA[cfA["Hit_1D"] == 1]
+        cfA_path = save_dir / f"carry_forward_1to3_5_{qdate}_{ts_suffix}.csv"
+        cfA.sort_values(["ConvProb_Inc3↦1_model", "inc_pred_3_over_1"], ascending=[False, False]).to_csv(cfA_path, index=False)
+
+        # Carry-forward B: Hit 3D → likely upcoming 5D
+        inc3_flag = (inc3 >= tgt3)
+        cfB = latest_df[["symbol","timestamp","close","volume"]].copy()
+        cfB["Hit_3D_increment"] = inc3_flag.astype(int)
+        cfB["inc_pred_5_over_3"] = np.array(inc_pred_5_over_3)
+        if model_conv5 is not None:
+            X_latest_ft5 = X_latest.copy().assign(Hit_1D=hit1_flag.astype(int), Inc3_Hit=inc3_flag.astype(int))
+            try:
+                p_ft5 = model_conv5.predict_proba(X_latest_ft5)[:, 1]
+            except Exception:
+                raw = model_conv5.predict(X_latest_ft5)
+                p_ft5 = 1/(1+np.exp(-np.clip(raw, -10, 10)))
+            cfB["ConvProb_Inc5↦3_model"] = p_ft5
+            expl5 = compute_shap_or_importance(model_conv5, X_latest_ft5, list(X_latest_ft5.columns))
+            cfB["SHAP_FT5_Top"] = ", ".join([f"{n}:{v:.3f}" for n, v in expl5.get('top_features', [])])
+        else:
+            cfB["ConvProb_Inc5↦3_model"] = np.nan
+            cfB["SHAP_FT5_Top"] = ""
+        cfB = cfB[cfB["Hit_3D_increment"] == 1]
+        cfB_path = save_dir / f"carry_forward_3to5_{qdate}_{ts_suffix}.csv"
+        cfB.sort_values(["ConvProb_Inc5↦3_model", "inc_pred_5_over_3"], ascending=[False, False]).to_csv(cfB_path, index=False)
+
+    return str(detailed_path), str(cfA_path) if cfA_path else None, str(cfB_path) if cfB_path else None
+
+# -------------------- GUI --------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Daily Metrics (GUI v4.0, NSE-aware)")
+        self.geometry("1020x780")
+        self.resizable(False, False)
+
+        # Inputs
+        self.panel_dir_var = tk.StringVar(value=DEFAULT_PANEL_DIR)
+        self.m1cls_var = tk.StringVar(value=DEFAULT_M1CLS)
+        self.m1reg_var = tk.StringVar(value="")          # optional 1D regressor
+        self.m3reg_var = tk.StringVar(value=DEFAULT_M3REG)
+        self.m5reg_var = tk.StringVar(value=DEFAULT_M5REG)
+
+        self.start_date_var = tk.StringVar()
+        self.end_date_var   = tk.StringVar()
+        self.upcoming_date_var = tk.StringVar()          # if blank, we auto-compute next trading date
+        self.min_prob_var   = tk.StringVar(value="0.60")
+
+        self.tgt1_var = tk.StringVar(value="2.0")
+        self.tgt3_var = tk.StringVar(value="2.0")
+        self.tgt5_var = tk.StringVar(value="2.0")
+        self.alpha_tol_var = tk.StringVar(value="0.8")
+
+        self.mode_var = tk.StringVar(value="backtest")   # 'backtest' or 'new_watchlist'
+
+        # Calibrator & SHAP options
+        self.calibrator_var = tk.StringVar(value="")
+        self.use_holiday_calendar_var = tk.BooleanVar(value=True)  # NSE-aware next trading date
+        self.use_local_shap_var       = tk.BooleanVar(value=True)
+        self.shap_topk_var            = tk.StringVar(value=str(DEFAULT_TOPK))
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        # Mode selector
+        ttk.Label(frm, text="Run mode:").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(frm, text="Back-test",     variable=self.mode_var, value="backtest").grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(frm, text="New Watchlist", variable=self.mode_var, value="new_watchlist").grid(row=0, column=2, sticky="w")
+
+        # Panel dir
+        ttk.Label(frm, text="Panel directory (parquet by year):").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.panel_dir_var, width=64).grid(row=1, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=self.choose_panel_dir).grid(row=1, column=2, padx=6)
+
+        # Models
+        ttk.Label(frm, text="1D Classifier joblib:").grid(row=2, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(frm, textvariable=self.m1cls_var, width=64).grid(row=2, column=1, sticky="we", pady=(8,0))
+        ttk.Button(frm, text="Browse", command=lambda: self.pick_model(self.m1cls_var)).grid(row=2, column=2, padx=6, pady=(8,0))
+
+        ttk.Label(frm, text="1D Regressor joblib (optional):").grid(row=3, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.m1reg_var, width=64).grid(row=3, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=lambda: self.pick_model(self.m1reg_var)).grid(row=3, column=2, padx=6)
+
+        ttk.Label(frm, text="3D Regressor joblib:").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.m3reg_var, width=64).grid(row=4, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=lambda: self.pick_model(self.m3reg_var)).grid(row=4, column=2, padx=6)
+
+        ttk.Label(frm, text="5D Regressor joblib:").grid(row=5, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.m5reg_var, width=64).grid(row=5, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=lambda: self.pick_model(self.m5reg_var)).grid(row=5, column=2, padx=6)
+
+        # Dates & thresholds
+        ttk.Label(frm, text="Start date (YYYY-MM-DD):").grid(row=6, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(frm, textvariable=self.start_date_var, width=20).grid(row=6, column=1, sticky="w", pady=(8,0))
+        ttk.Label(frm, text="End date (YYYY-MM-DD):").grid(row=7, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.end_date_var, width=20).grid(row=7, column=1, sticky="w")
+
+        ttk.Label(frm, text="Upcoming date (YYYY-MM-DD) [optional]:").grid(row=8, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.upcoming_date_var, width=20).grid(row=8, column=1, sticky="w")
+        ttk.Checkbutton(frm, text="Use NSE holiday calendar (compute NextTradingDate)", variable=self.use_holiday_calendar_var).grid(row=8, column=2, sticky="w")
+
+        ttk.Label(frm, text="Min prob 1D (0.00–1.00):").grid(row=9, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(frm, textvariable=self.min_prob_var, width=10).grid(row=9, column=1, sticky="w", pady=(8,0))
+
+        ttk.Label(frm, text="Targets (%): T1 (1D), T3 (3↦1 inc), T5 (5↦3 inc)").grid(row=10, column=0, sticky="w")
+        tgrid = ttk.Frame(frm); tgrid.grid(row=10, column=1, sticky="w")
+        ttk.Entry(tgrid, textvariable=self.tgt1_var, width=6).grid(row=0, column=0)
+        ttk.Entry(tgrid, textvariable=self.tgt3_var, width=6).grid(row=0, column=1, padx=6)
+        ttk.Entry(tgrid, textvariable=self.tgt5_var, width=6).grid(row=0, column=2)
+        ttk.Label(frm, text="Pred tolerance α (met pred when R ≥ α·P)").grid(row=11, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.alpha_tol_var, width=6).grid(row=11, column=1, sticky="w")
+
+        # Calibrator & SHAP
+        ttk.Label(frm, text="Calibrator pickle (optional):").grid(row=12, column=0, sticky="w", pady=(6,0))
+        ttk.Entry(frm, textvariable=self.calibrator_var, width=64).grid(row=12, column=1, sticky="we", pady=(6,0))
+        ttk.Button(frm, text="Browse", command=lambda: self.pick_model(self.calibrator_var)).grid(row=12, column=2, padx=6, pady=(6,0))
+
+        ttk.Checkbutton(frm, text="Compute local SHAP per symbol", variable=self.use_local_shap_var).grid(row=13, column=0, sticky="w")
+        ttk.Label(frm, text="Top‑K SHAP (default 3):").grid(row=13, column=1, sticky="w")
+        ttk.Entry(frm, textvariable=self.shap_topk_var, width=6).grid(row=13, column=2, sticky="w")
+
+        # Progress & status
+        self.pb = ttk.Progressbar(frm, orient="horizontal", length=860, mode="determinate")
+        self.pb.grid(row=14, column=0, columnspan=3, pady=(16,6))
+        self.status = tk.Text(frm, height=16, width=120)
+        self.status.grid(row=15, column=0, columnspan=3, sticky="we")
+        self.status.configure(state="disabled")
+
+        # Buttons
+        btnfrm = ttk.Frame(frm); btnfrm.grid(row=16, column=0, columnspan=3, pady=(12,0))
+        ttk.Button(btnfrm, text="Run",  command=self.run).grid(row=0, column=0, padx=6)
+        ttk.Button(btnfrm, text="Exit", command=self.destroy).grid(row=0, column=1, padx=6)
+
+        frm.columnconfigure(1, weight=1)
+
+    # GUI helpers
+    def choose_panel_dir(self):
+        d = filedialog.askdirectory(title="Select panel directory")
+        if d:
+            self.panel_dir_var.set(d)
+
+    def pick_model(self, var):
+        f = filedialog.askopenfilename(title="Select model file",
+                                       filetypes=[("Model files","*.joblib;*.pkl"), ("All","*.*")])
+        if f:
+            var.set(f)
+
+    def log(self, msg: str):
+        self.status.configure(state="normal")
+        self.status.insert("end", msg + "\n")
+        self.status.see("end")
+        self.status.configure(state="disabled")
+        self.update_idletasks()
+
+    def run(self):
+        try:
+            panel_dir = Path(self.panel_dir_var.get().strip())
+            if not panel_dir.exists():
+                messagebox.showerror("Error", "Panel directory does not exist.")
+                return
+
+            desk = Path.home() / "Desktop" / "Predictions"
+            desk.mkdir(parents=True, exist_ok=True)
+
+            # Dates
+            try:
+                start = pd.to_datetime(self.start_date_var.get().strip()).date()
+                end   = pd.to_datetime(self.end_date_var.get().strip()).date()
+            except Exception:
+                messagebox.showerror("Error", "Invalid start/end date. Use YYYY-MM-DD.")
+                return
+            if start > end:
+                messagebox.showerror("Error", "Start date must be ≤ End date.")
+                return
+
+            upcoming_input = self.upcoming_date_var.get().strip()
+
+            # Load panel & features
+            self.log(f"Loading panel from: {panel_dir}")
+            panel = read_panel_from_dir(panel_dir)
+            feats = feature_columns_from_panel(panel)
+            self.log(f"Feature columns detected: {len(feats)}")
+
+            # Load models
+            models = {
+                'm1_cls': load_model(self.m1cls_var.get().strip()),
+                'm1_reg': load_model(self.m1reg_var.get().strip()),
+                'm3_reg': load_model(self.m3reg_var.get().strip()),
+                'm5_reg': load_model(self.m5reg_var.get().strip()),
+            }
+            for k, v in models.items():
+                self.log(f"{k}: {'OK' if v is not None else 'MISSING'}")
+
+            # Date list for back-test
+            days = []
+            cur = start
+            while cur <= end:
+                days.append(cur.isoformat())
+                cur = cur + dt.timedelta(days=1)
+            self.pb.configure(maximum=len(days))
+            self.pb['value'] = 0
+
+            # Parse numerics
+            try:
+                min_prob = float(self.min_prob_var.get().strip())
+                tgt1     = float(self.tgt1_var.get().strip())
+                tgt3     = float(self.tgt3_var.get().strip())
+                tgt5     = float(self.tgt5_var.get().strip())
+                alpha_tol = float(self.alpha_tol_var.get().strip())
+                shap_topk = int(self.shap_topk_var.get().strip() or DEFAULT_TOPK)
+            except Exception:
+                messagebox.showerror("Error", "Invalid numeric input(s).")
+                return
+
+            if self.mode_var.get() == "backtest":
+                summaries = []
+                all_rows  = []
+                for i, d in enumerate(days, start=1):
+                    self.log(f"Processing {d}...")
+                    try:
+                        res = process_one_date(panel, feats, models, d, min_prob, desk)
+                        if res.get("csv"):
+                            self.log(json.dumps(res, indent=2))
+                            try:
+                                day_df = pd.read_csv(Path(res["csv"]))
+                                all_rows.append(day_df)
+                            except Exception as e:
+                                self.log(f"[WARN] Could not reload {res['csv']}: {e}")
+                        else:
+                            self.log(f"{d}: {res.get('note','No data')}")
+                        summaries.append(res)
+                    except Exception as e:
+                        self.log(f"[ERROR] {d}: {e}")
+                    self.pb['value'] = i
+                    self.update_idletasks()
+
+                sum_df = pd.DataFrame(summaries)
+                ts_suffix = dt.datetime.now().strftime("%H%M%S")
+                sum_path = desk / f"daily_metrics_summary_{start}_{end}_{ts_suffix}.csv"
+                sum_df.to_csv(sum_path, index=False)
+                self.log(f"Saved summary: {sum_path}")
+
+                if len(all_rows) > 0:
+                    ladder_df = pd.concat(all_rows, ignore_index=True)
+                    overall, by_bucket = ladder_stats_incremental(ladder_df, tgt1=tgt1, tgt3=tgt3, tgt5=tgt5)
+
+                    ladder_overall_path = desk / f"ladder_incremental_overall_{start}_{end}_{ts_suffix}.json"
+                    with open(ladder_overall_path, 'w', encoding='utf-8') as f:
+                        json.dump(overall, f, indent=2)
+                    ladder_bucket_path = desk / f"ladder_incremental_by_bucket_{start}_{end}_{ts_suffix}.csv"
+                    by_bucket.to_csv(ladder_bucket_path, index=False)
+                    self.log(f"Saved ladder stats: {ladder_overall_path}")
+                    self.log(f"Saved ladder by bucket: {ladder_bucket_path}")
+
+                    calib_df = build_prob_calibration(ladder_df, tgt1=tgt1)
+                    calib_path = desk / f"prob_calibration_{start}_{end}_{ts_suffix}.csv"
+                    calib_df.to_csv(calib_path, index=False)
+                    self.log(f"Saved probability calibration: {calib_path}")
+
+                messagebox.showinfo("Done", f"Saved files to: {desk}")
+
+            else:
+                # New Watchlist: build historical calibration & conversion stats over [start, hist_end]
+                hist_end = (end - dt.timedelta(days=1)) if (end - start).days >= 1 else end
+
+                hist_rows = []
+                cur = start
+                while cur <= hist_end:
+                    mask = panel['timestamp'].dt.date == cur
+                    day_df = panel.loc[mask]
+                    if len(day_df) == 0:
+                        cur += dt.timedelta(days=1)
+                        continue
+                    Xd = sanitize_feature_matrix(day_df[feats].copy())
+                    prob_up_1d = predict_prob_1d(models.get('m1_cls'), Xd)
+                    tmp = day_df[["symbol","timestamp"]].copy()
+                    tmp["prob_up_1d"]      = prob_up_1d
+                    tmp["real_ret_1d_pct"] = pd.to_numeric(day_df.get("ret_1d_close_pct"), errors='coerce').values
+                    tmp["real_ret_3d_pct"] = pd.to_numeric(day_df.get("ret_3d_close_pct"), errors='coerce').values
+                    tmp["real_ret_5d_pct"] = pd.to_numeric(day_df.get("ret_5d_close_pct"), errors='coerce').values
+                    tmp["inc_real_3_over_1"] = inc_over(tmp["real_ret_3d_pct"], tmp["real_ret_1d_pct"])
+                    tmp["inc_real_5_over_3"] = inc_over(tmp["real_ret_5d_pct"], tmp["real_ret_3d_pct"])
+                    hist_rows.append(tmp)
+                    cur += dt.timedelta(days=1)
+
+                calib_df = None
+                conv_df  = None
+                model_conv3 = None
+                model_conv5 = None
+                ts_suffix = dt.datetime.now().strftime("%H%M%S")
+
+                if len(hist_rows) > 0:
+                    hist_df = pd.concat(hist_rows, ignore_index=True)
+                    calib_df = build_prob_calibration(hist_df, tgt1=tgt1)
+                    overall_inc, conv_df = ladder_stats_incremental(hist_df, tgt1=tgt1, tgt3=tgt3, tgt5=tgt5)
+
+                    calib_path = desk / f"prob_calibration_{start}_{hist_end}_{ts_suffix}.csv"
+                    conv_path  = desk / f"ladder_incremental_by_bucket_{start}_{hist_end}_{ts_suffix}.csv"
+                    calib_df.to_csv(calib_path, index=False)
+                    conv_df.to_csv(conv_path, index=False)
+                    # ----------------- FIXED f-string below -----------------
+                    self.log(f"Saved calibration & conversion stats: {calib_path} | {conv_path}")
+
+                    # Train follow-through models over [start, hist_end]
+                    model_conv3, model_conv5 = train_follow_through_models(panel, feats, start, hist_end,
+                                                                           tgt1=tgt1, tgt3=tgt3, tgt5=tgt5,
+                                                                           alpha_tol=alpha_tol)
+                    self.log(f"Follow-through models: FT3={'OK' if model_conv3 else 'MISSING'} | FT5={'OK' if model_conv5 else 'MISSING'}")
+                else:
+                    self.log("[WARN] No historical rows found for calibration; using raw model probabilities.")
+
+                # Resolve upcoming trading date:
+                if upcoming_input:
+                    base = pd.to_datetime(upcoming_input).normalize()
+                    upcoming_trading = next_trading_date(base, NSE_HOLIDAYS_2025) if self.use_holiday_calendar_var.get() else base
+                else:
+                    base = pd.to_datetime(end).normalize()
+                    upcoming_trading = next_trading_date(base, NSE_HOLIDAYS_2025) if self.use_holiday_calendar_var.get() else (base + pd.Timedelta(days=1))
+                    self.upcoming_date_var.set(upcoming_trading.date().isoformat())
+
+                self.log(f"Upcoming trading date (NSE): {upcoming_trading.date()}")
+
+                # Build watchlist + compact next-day export (+ picks)
+                detailed_path, cfA_path, cfB_path = build_new_watchlist(
+                    panel, feats, models,
+                    upcoming_trading_date=upcoming_trading,
+                    calib_df=calib_df, conv_df=conv_df, save_dir=desk,
+                    tgt1=tgt1, tgt3=tgt3, tgt5=tgt5,
+                    model_conv3=model_conv3, model_conv5=model_conv5,
+                    calibrator_pickle=(self.calibrator_var.get().strip() or None),
+                    use_local_shap=self.use_local_shap_var.get(),
+                    shap_topk=int(self.shap_topk_var.get().strip() or DEFAULT_TOPK)
+                )
+                self.log(f"Saved new watchlist (detailed): {detailed_path}")
+                self.log(f"Saved compact next-day files to: {DEFAULT_NEXTDAY_DIR}")
+                self.log(f"Picks file: {DEFAULT_NEXTDAY_DIR / 'watchlist_nextday_picks.csv'}")
+                if cfA_path:
+                    self.log(f"Saved carry-forward (Hit 1D → likely 3D/5D): {cfA_path}")
+                if cfB_path:
+                    self.log(f"Saved carry-forward (Hit 3D → likely 5D): {cfB_path}")
+
+                messagebox.showinfo("Done",
+                                    f"Detailed files: {desk}\n"
+                                    f"Next-day panel files: {DEFAULT_NEXTDAY_DIR}\n"
+                                    f"Picks: {DEFAULT_NEXTDAY_DIR / 'watchlist_nextday_picks.csv'}")
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+if __name__ == '__main__':
+    App().mainloop()
