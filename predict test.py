@@ -73,19 +73,28 @@ def next_trading_date(start_date: pd.Timestamp, holidays: Set[pd.Timestamp]) -> 
 
 # -------------------- Helpers --------------------
 def sanitize_feature_matrix(X: pd.DataFrame) -> pd.DataFrame:
+    """Normalize feature dtypes for modeling while keeping vectorized operations fast."""
     X = X.copy()
-    for c in X.columns:
-        if X[c].dtype == bool:
-            X[c] = X[c].astype(int)
-        elif X[c].dtype == object:
-            s = X[c].astype(str).str.lower()
-            uniq = set(s.unique())
-            if uniq <= {"true", "false", "nan"}:
-                X[c] = s.map({"true": 1, "false": 0}).astype("Int64").fillna(0).astype(int)
-            else:
-                X[c] = pd.to_numeric(X[c], errors="coerce")
-        if c.startswith(("CPR_Yday_", "CPR_Tmr_", "Struct_", "DayType_")):
-            X[c] = X[c].fillna(0).astype(int)
+
+    bool_cols = list(X.select_dtypes(include=["bool"]).columns)
+    if bool_cols:
+        X[bool_cols] = X[bool_cols].astype(int)
+
+    obj_cols = list(X.select_dtypes(include=["object"]).columns)
+    for c in obj_cols:
+        s = X[c].astype(str).str.lower()
+        uniq = set(s.unique())
+        if uniq <= {"true", "false", "nan"}:
+            X[c] = s.map({"true": 1, "false": 0}).astype("Int64").fillna(0).astype(int)
+        else:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    prefix_cols = [
+        c for c in X.columns
+        if c.startswith(("CPR_Yday_", "CPR_Tmr_", "Struct_", "DayType_"))
+    ]
+    if prefix_cols:
+        X[prefix_cols] = X[prefix_cols].fillna(0).astype(int)
     return X
 
 def feature_columns_from_panel(panel: pd.DataFrame) -> List[str]:
